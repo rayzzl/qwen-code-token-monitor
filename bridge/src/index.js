@@ -96,16 +96,21 @@ function saveOffsets() {
 function readNewLines(file) {
   const stat = fs.statSync(file);
   const prevOffset = fileOffsets.get(file) ?? 0;
-  if (stat.size <= prevOffset) return '';
+  // File was truncated or rotated — reset offset and read from beginning
+  if (stat.size < prevOffset) {
+    fileOffsets.set(file, 0);
+  }
+  const effectiveOffset = fileOffsets.get(file) ?? 0;
+  if (stat.size <= effectiveOffset) return '';
   const fd = fs.openSync(file, 'r');
   try {
-    const len = stat.size - prevOffset;
+    const len = stat.size - effectiveOffset;
     const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, prevOffset);
+    fs.readSync(fd, buf, 0, len, effectiveOffset);
     fileOffsets.set(file, stat.size);
     let content = buf.toString('utf8');
     // Skip partial first line when resuming mid-file
-    if (prevOffset > 0) {
+    if (effectiveOffset > 0) {
       const nl = content.indexOf('\n');
       if (nl >= 0) content = content.slice(nl + 1);
       else content = '';
