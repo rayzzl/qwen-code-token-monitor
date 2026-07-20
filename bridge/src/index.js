@@ -13,6 +13,7 @@ const INTERVAL_MS = Number(process.env.QWEN_BLE_PUSH_MS ?? 1000);
 const RECENT_DAYS = Number(process.env.QWEN_BLE_SCAN_DAYS ?? 7);
 const ACTIVE_GAP_MS = 5 * 60 * 1000;
 const STATUS_FILE = '/tmp/qwen-token-status.json';
+const OFFSET_FILE = '/tmp/qwen-token-offsets.json';
 
 let dataChar = null;
 let bleConnected = false;
@@ -21,6 +22,11 @@ let connectedPeripheral = null;
 let scanTimer = null;
 let pushTimer = null;
 let connecting = false;
+
+// Incremental read state: tracks per-file byte offsets and accumulated stats
+let fileOffsets = new Map();
+let accStats = null;
+let accDayStr = '';
 
 function parseEnvFile(file) {
   try {
@@ -59,6 +65,65 @@ function usageFiles() {
     // Keep the bridge alive if a usage file is rotated while scanning.
   }
   return files.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+}
+
+function loadOffsets() {
+  try {
+    const raw = fs.readFileSync(OFFSET_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    fileOffsets = new Map(Object.entries(obj.offsets ?? {}));
+    accStats = obj.accStats ?? null;
+    accDayStr = obj.accDayStr ?? '';
+  } catch {
+    fileOffsets = new Map();
+    accStats = null;
+    accDayStr = '';
+  }
+}
+
+function saveOffsets() {
+  try {
+    fs.writeFileSync(OFFSET_FILE, JSON.stringify({
+      offsets: Object.fromEntries(fileOffsets),
+      accStats,
+      accDayStr,
+    }));
+  } catch (err) {
+    console.error('[offset] save failed:', err.message);
+  }
+}
+
+function readNewLines(file) {
+  const stat = fs.statSync(file);
+  const prevOffset = fileOffsets.get(file) ?? 0;
+  if (stat.size <= prevOffset) return '';
+  const fd = fs.openSync(file, 'r');
+  try {
+    const len = stat.size - prevOffset;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, prevOffset);
+    fileOffsets.set(file, stat.size);
+    let content = buf.toString('utf8');
+    // Skip partial first line when resuming mid-file
+    if (prevOffset > 0) {
+      const nl = content.indexOf('\n');
+      if (nl >= 0) content = content.slice(nl + 1);
+      else content = '';
+    }
+    return content;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function emptyAcc() {
+  return {
+    todayTotal: 0, todayInput: 0, todayOutput: 0,
+    todayCached: 0, todayThought: 0,
+    callsToday: 0, weekTotal: 0,
+    sessions: [], sessionEvents: {}, modelTotals: {},
+    latest: null,
+  };
 }
 
 function clampPct(n) {
@@ -113,25 +178,17 @@ function buildReport() {
   const weekCutoff = Date.now() - RECENT_DAYS * 24 * 60 * 60 * 1000;
   const files = usageFiles();
 
-  let todayTotal = 0;
-  let todayInput = 0;
-  let todayOutput = 0;
-  let todayCached = 0;
-  let todayThought = 0;
-  let callsToday = 0;
-  let weekTotal = 0;
-  const todaySessions = new Set();
-  const sessionEvents = new Map();
-  const modelTotals = new Map();
-  let latest = null;
+  // Reset accumulated stats on day change
+  if (!accStats || accDayStr !== todayDateStr) {
+    accStats = emptyAcc();
+    accDayStr = todayDateStr;
+    fileOffsets.clear();
+  }
 
+  // Incremental read: only process new bytes since last scan
   for (const { file } of files) {
-    let content;
-    try {
-      content = fs.readFileSync(file, 'utf8');
-    } catch {
-      continue;
-    }
+    const content = readNewLines(file);
+    if (!content) continue;
     for (const line of content.split(/\r?\n/)) {
       if (!line.trim()) continue;
       let rec;
@@ -147,32 +204,33 @@ function buildReport() {
       const isWeek = Number.isFinite(ts) && ts >= weekCutoff;
 
       if (isToday) {
-        callsToday++;
-        if (rec.sessionId) todaySessions.add(rec.sessionId);
+        accStats.callsToday++;
+        if (rec.sessionId && !accStats.sessions.includes(rec.sessionId)) {
+          accStats.sessions.push(rec.sessionId);
+        }
 
         const key = String(rec.sessionId ?? '');
         if (Number.isFinite(ts)) {
-          const events = sessionEvents.get(key) ?? [];
-          events.push(ts);
-          sessionEvents.set(key, events);
+          if (!accStats.sessionEvents[key]) accStats.sessionEvents[key] = [];
+          accStats.sessionEvents[key].push(ts);
         }
 
-        todayTotal += rec.totalTokens ?? 0;
-        todayInput += rec.inputTokens ?? 0;
-        todayOutput += rec.outputTokens ?? 0;
-        todayCached += rec.cachedTokens ?? 0;
-        todayThought += rec.thoughtsTokens ?? 0;
+        accStats.todayTotal += rec.totalTokens ?? 0;
+        accStats.todayInput += rec.inputTokens ?? 0;
+        accStats.todayOutput += rec.outputTokens ?? 0;
+        accStats.todayCached += rec.cachedTokens ?? 0;
+        accStats.todayThought += rec.thoughtsTokens ?? 0;
 
         const model = modelName(rec);
-        modelTotals.set(model, (modelTotals.get(model) ?? 0) + (rec.totalTokens ?? 0));
+        accStats.modelTotals[model] = (accStats.modelTotals[model] ?? 0) + (rec.totalTokens ?? 0);
       }
 
       if (isWeek) {
-        weekTotal += rec.totalTokens ?? 0;
+        accStats.weekTotal += rec.totalTokens ?? 0;
       }
 
-      if (Number.isFinite(ts) && (!latest || ts > latest.ts)) {
-        latest = {
+      if (Number.isFinite(ts) && (!accStats.latest || ts > accStats.latest.ts)) {
+        accStats.latest = {
           ts,
           input: rec.inputTokens ?? 0,
           total: rec.totalTokens ?? 0,
@@ -182,28 +240,33 @@ function buildReport() {
     }
   }
 
+  saveOffsets();
+
   const now = Date.now();
+  const latest = accStats.latest;
   const latestTs = latest?.ts ?? now;
-  const models = topModels(modelTotals, todayTotal);
+  const modelTotals = new Map(Object.entries(accStats.modelTotals));
+  const sessionEvents = new Map(Object.entries(accStats.sessionEvents));
+  const models = topModels(modelTotals, accStats.todayTotal);
   return {
-    todayTotal,
+    todayTotal: accStats.todayTotal,
     ctxPct: 0,
-    callsToday,
+    callsToday: accStats.callsToday,
     errorsToday: 0,
-    sessionsToday: todaySessions.size,
-    cacheRate: todayInput > 0 ? clampPct((todayCached / todayInput) * 100) : 0,
+    sessionsToday: accStats.sessions.length,
+    cacheRate: accStats.todayInput > 0 ? clampPct((accStats.todayCached / accStats.todayInput) * 100) : 0,
     activeMinutes: activeMinutes(sessionEvents),
     currentTokens: latest?.input ?? 0,
     lastCallTokens: latest?.total ?? 0,
-    todayInput,
-    todayOutput,
-    todayCached,
-    todayThought,
+    todayInput: accStats.todayInput,
+    todayOutput: accStats.todayOutput,
+    todayCached: accStats.todayCached,
+    todayThought: accStats.todayThought,
     model: latest?.model ?? 'qwen',
     models,
     updatedAt: formatStamp(now),
     ageSec: Math.max(0, Math.round((now - latestTs) / 1000)),
-    weekTotal,
+    weekTotal: accStats.weekTotal,
   };
 }
 
@@ -344,6 +407,7 @@ noble.on('discover', (peripheral) => {
   connect(peripheral);
 });
 
+loadOffsets();
 startPushLoop();
 
 function shutdown() {
