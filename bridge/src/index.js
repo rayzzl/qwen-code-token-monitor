@@ -94,30 +94,42 @@ function saveOffsets() {
 }
 
 function readNewLines(file) {
-  const stat = fs.statSync(file);
-  const prevOffset = fileOffsets.get(file) ?? 0;
-  // File was truncated or rotated — reset offset and read from beginning
-  if (stat.size < prevOffset) {
-    fileOffsets.set(file, 0);
-  }
-  const effectiveOffset = fileOffsets.get(file) ?? 0;
-  if (stat.size <= effectiveOffset) return '';
-  const fd = fs.openSync(file, 'r');
   try {
-    const len = stat.size - effectiveOffset;
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, effectiveOffset);
-    fileOffsets.set(file, stat.size);
-    let content = buf.toString('utf8');
-    // Skip partial first line when resuming mid-file
-    if (effectiveOffset > 0) {
-      const nl = content.indexOf('\n');
-      if (nl >= 0) content = content.slice(nl + 1);
-      else content = '';
+    const stat = fs.statSync(file);
+    let prevOffset = fileOffsets.get(file) ?? 0;
+    // File was truncated or rotated — reset offset and read from beginning
+    if (stat.size < prevOffset) {
+      prevOffset = 0;
     }
-    return content;
-  } finally {
-    fs.closeSync(fd);
+    if (stat.size <= prevOffset) return '';
+    const fd = fs.openSync(file, 'r');
+    try {
+      const len = stat.size - prevOffset;
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, prevOffset);
+      let content = buf.toString('utf8');
+      // Only advance offset to the last complete newline to avoid
+      // splitting a JSON record across two reads
+      const lastNl = content.lastIndexOf('\n');
+      if (lastNl >= 0) {
+        const validContent = content.slice(0, lastNl + 1);
+        fileOffsets.set(file, prevOffset + Buffer.byteLength(validContent, 'utf8'));
+        // Skip partial first line when resuming mid-file
+        if (prevOffset > 0) {
+          const firstNl = validContent.indexOf('\n');
+          if (firstNl >= 0) return validContent.slice(firstNl + 1);
+          return '';
+        }
+        return validContent;
+      }
+      // No complete line yet — don't advance offset
+      return '';
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    console.error(`[readNewLines] failed to read ${file}:`, err.message);
+    return '';
   }
 }
 
