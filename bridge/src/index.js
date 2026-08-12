@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { execSync } from 'node:child_process';
 import noble from '@abandonware/noble';
 
 const BLE_DEVICE_NAMES = new Set(
@@ -334,8 +335,11 @@ function startScan() {
 
 noble.on('stateChange', (state) => {
   console.log(`[ble] adapter state: ${state}`);
-  if (state === 'poweredOn') startScan();
-  else noble.stopScanning();
+  if (state === 'poweredOn') {
+    resetAndScan();
+  } else {
+    noble.stopScanning();
+  }
 });
 
 noble.on('discover', (peripheral) => {
@@ -343,6 +347,34 @@ noble.on('discover', (peripheral) => {
   if (!BLE_DEVICE_NAMES.has(name)) return;
   connect(peripheral);
 });
+
+function resetAndScan() {
+  dataChar = null;
+  connectedPeripheral = null;
+  bleConnected = false;
+  connecting = false;
+  clearTimeout(scanTimer);
+  try { noble.stopScanning(); } catch {}
+  startScan();
+}
+
+let lastWakeCheck = Date.now();
+const WAKE_CHECK_INTERVAL_MS = 30_000;
+const WAKE_THRESHOLD_MS = 10_000;
+
+setInterval(() => {
+  const now = Date.now();
+  const elapsed = now - lastWakeCheck;
+  lastWakeCheck = now;
+  if (elapsed > WAKE_CHECK_INTERVAL_MS + WAKE_THRESHOLD_MS) {
+    console.log(`[wake] detected sleep/wake (gap=${Math.round(elapsed / 1000)}s), resetting BLE`);
+    resetAndScan();
+  }
+}, WAKE_CHECK_INTERVAL_MS);
+
+try {
+  execSync('caffeinate -dimsu -t 1 &', { stdio: 'ignore' });
+} catch {}
 
 startPushLoop();
 
