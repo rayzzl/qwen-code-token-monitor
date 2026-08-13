@@ -309,6 +309,7 @@ function connect(peripheral) {
       dataChar = await discoverCharacteristic(peripheral);
       bleConnected = true;
       console.log('[ble] ready');
+      startPushLoop();
     } catch (e) {
       console.error('[ble] discover failed:', e.message);
       try { peripheral.disconnect(); } catch {}
